@@ -224,7 +224,8 @@ defmodule SpandexDatadog.ApiServer do
       type: span.type,
       meta: meta(span),
       metrics: %{
-        _sampling_priority_v1: priority
+        _sampling_priority_v1: priority,
+        "_dd1.sr.eausr": 1.0
       }
     }
   end
