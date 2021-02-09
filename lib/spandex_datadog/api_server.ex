@@ -153,32 +153,10 @@ defmodule SpandexDatadog.ApiServer do
       Logger.debug(fn -> "Trace: #{inspect(all_traces)}" end)
     end
 
-    if asynchronous? do
-      below_sync_threshold? =
-        Agent.get_and_update(agent_pid, fn count ->
-          if count < sync_threshold do
-            {true, count + 1}
-          else
-            {false, count}
-          end
-        end)
-
-      if below_sync_threshold? do
-        Task.start(fn ->
-          try do
-            send_and_log(all_traces, state)
-          after
-            Agent.update(agent_pid, fn count -> count - 1 end)
-          end
-        end)
-      else
-        # We get benefits from running in a separate process (like better GC)
-        # So we async/await here to mimic the behavour above but still apply backpressure
-        task = Task.async(fn -> send_and_log(all_traces, state) end)
-        Task.await(task)
-      end
-    else
+    try do
       send_and_log(all_traces, state)
+    rescue
+      error -> Logger.warn(fn -> "Error sending trace: #{inspect(error)}" end)
     end
 
     {:reply, :ok, %{state | waiting_traces: []}}
