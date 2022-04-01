@@ -26,62 +26,49 @@ defmodule SpandexDatadog.ApiServer do
       :waiting_traces,
       :batch_size,
       :sync_threshold,
-      :agent_pid
+      :agent_pid,
+      :container_id
     ]
   end
 
+  # Same as HTTPoison.headers
+  @type headers :: [{atom, binary}] | [{binary, binary}] | %{binary => binary} | any
+
   @headers [{"Content-Type", "application/msgpack"}]
 
-  @start_link_opts Optimal.schema(
-                     opts: [
-                       host: :string,
-                       port: [:integer, :string],
-                       verbose?: :boolean,
-                       http: :atom,
-                       batch_size: :integer,
-                       sync_threshold: :integer,
-                       api_adapter: :atom
-                     ],
-                     defaults: [
-                       host: "localhost",
-                       port: 8126,
-                       verbose?: false,
-                       batch_size: 10,
-                       sync_threshold: 20,
-                       api_adapter: SpandexDatadog.ApiServer
-                     ],
-                     required: [:http],
-                     describe: [
-                       verbose?: "Only to be used for debugging: All finished traces will be logged",
-                       host: "The host the agent can be reached at",
-                       port: "The port to use when sending traces to the agent",
-                       batch_size: "The number of traces that should be sent in a single batch",
-                       sync_threshold:
-                         "The maximum number of processes that may be sending traces at any one time. This adds backpressure",
-                       http:
-                         "The HTTP module to use for sending spans to the agent. Currently only HTTPoison has been tested",
-                       api_adapter: "Which api adapter to use. Currently only used for testing"
-                     ]
-                   )
+  @default_opts [
+    host: "localhost",
+    http: HTTPoison,
+    port: 8126,
+    verbose?: false,
+    batch_size: 10,
+    sync_threshold: 20,
+    api_adapter: SpandexDatadog.ApiServer
+  ]
 
   @doc """
-  Starts genserver with given options.
+  Starts the ApiServer with given options.
 
-  #{Optimal.Doc.document(@start_link_opts)}
+  ## Options
+
+  * `:http` - The HTTP module to use for sending spans to the agent. Defaults to `HTTPoison`.
+  * `:host` - The host the agent can be reached at. Defaults to `"localhost"`.
+  * `:port` - The port to use when sending traces to the agent. Defaults to `8126`.
+  * `:verbose?` - Only to be used for debugging: All finished traces will be logged. Defaults to `false`
+  * `:batch_size` - The number of traces that should be sent in a single batch. Defaults to `10`.
+  * `:sync_threshold` - The maximum number of processes that may be sending traces at any one time. This adds backpressure. Defaults to `20`.
   """
   @spec start_link(opts :: Keyword.t()) :: GenServer.on_start()
-  def start_link(opts) do
-    opts = Optimal.validate!(opts, @start_link_opts)
+  def start_link(opts \\ []) do
+    opts = Keyword.merge(@default_opts, opts)
 
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc """
-  Builds server state.
-  """
+  @doc false
   @spec init(opts :: Keyword.t()) :: {:ok, State.t()}
   def init(opts) do
-    {:ok, agent_pid} = Agent.start_link(fn -> 0 end, name: :spandex_currently_send_count)
+    {:ok, agent_pid} = Agent.start_link(fn -> 0 end)
 
     state = %State{
       asynchronous_send?: true,
@@ -92,10 +79,25 @@ defmodule SpandexDatadog.ApiServer do
       waiting_traces: [],
       batch_size: opts[:batch_size],
       sync_threshold: opts[:sync_threshold],
-      agent_pid: agent_pid
+      agent_pid: agent_pid,
+      container_id: get_container_id()
     }
 
     {:ok, state}
+  end
+
+  @cgroup_uuid "[0-9a-f]{8}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{4}[-_][0-9a-f]{12}"
+  @cgroup_ctnr "[0-9a-f]{64}"
+  @cgroup_task "[0-9a-f]{32}-\\d+"
+  @cgroup_regex Regex.compile!(".*(#{@cgroup_uuid}|#{@cgroup_ctnr}|#{@cgroup_task})(?:\\.scope)?$", "m")
+
+  defp get_container_id() do
+    with {:ok, file_binary} <- File.read("/proc/self/cgroup"),
+         [_, container_id] <- Regex.run(@cgroup_regex, file_binary) do
+      container_id
+    else
+      _ -> nil
+    end
   end
 
   @doc """
@@ -103,8 +105,11 @@ defmodule SpandexDatadog.ApiServer do
   """
   @spec send_trace(Trace.t(), Keyword.t()) :: :ok
   def send_trace(%Trace{} = trace, opts \\ []) do
-    timeout = Keyword.get(opts, :timeout, 30_000)
-    GenServer.call(__MODULE__, {:send_trace, trace}, timeout)
+    :telemetry.span([:spandex_datadog, :send_trace], %{trace: trace}, fn ->
+      timeout = Keyword.get(opts, :timeout, 30_000)
+      result = GenServer.call(__MODULE__, {:send_trace, trace}, timeout)
+      {result, %{trace: trace}}
+    end)
   end
 
   @deprecated "Please use send_trace/2 instead"
@@ -117,80 +122,25 @@ defmodule SpandexDatadog.ApiServer do
   end
 
   @doc false
-  def handle_call(
-        {:send_trace, trace},
-        _from,
-        %State{waiting_traces: waiting_traces, batch_size: batch_size, verbose?: verbose?} = state
-      )
-      when length(waiting_traces) + 1 < batch_size do
-    if verbose? do
-      Logger.info(fn -> "Adding trace to stack with #{Enum.count(trace.spans)} spans" end)
-    end
+  def handle_call({:send_trace, trace}, _from, state) do
+    state =
+      state
+      |> enqueue_trace(trace)
+      |> maybe_flush_traces()
 
-    {:reply, :ok, %{state | waiting_traces: [trace | waiting_traces]}}
-  end
-
-  def handle_call(
-        {:send_trace, trace},
-        _from,
-        %State{
-          verbose?: verbose?,
-          asynchronous_send?: asynchronous?,
-          waiting_traces: waiting_traces,
-          sync_threshold: sync_threshold,
-          agent_pid: agent_pid
-        } = state
-      ) do
-    all_traces = [trace | waiting_traces]
-
-    if verbose? do
-      trace_count = length(all_traces)
-
-      span_count = Enum.reduce(all_traces, 0, fn trace, acc -> acc + length(trace.spans) end)
-
-      Logger.info(fn -> "Sending #{trace_count} traces, #{span_count} spans." end)
-
-      Logger.debug(fn -> "Trace: #{inspect(all_traces)}" end)
-    end
-
-    if asynchronous? do
-      below_sync_threshold? =
-        Agent.get_and_update(agent_pid, fn count ->
-          if count < sync_threshold do
-            {true, count + 1}
-          else
-            {false, count}
-          end
-        end)
-
-      if below_sync_threshold? do
-        Task.start(fn ->
-          try do
-            send_and_log(all_traces, state)
-          after
-            Agent.update(agent_pid, fn count -> count - 1 end)
-          end
-        end)
-      else
-        # We get benefits from running in a separate process (like better GC)
-        # So we async/await here to mimic the behavour above but still apply backpressure
-        task = Task.async(fn -> send_and_log(all_traces, state) end)
-        Task.await(task)
-      end
-    else
-      send_and_log(all_traces, state)
-    end
-
-    {:reply, :ok, %{state | waiting_traces: []}}
+    {:reply, :ok, state}
   end
 
   @spec send_and_log([Trace.t()], State.t()) :: :ok
-  def send_and_log(traces, %{verbose?: verbose?} = state) do
+  def send_and_log(traces, %{container_id: container_id, verbose?: verbose?} = state) do
+    headers = @headers ++ [{"X-Datadog-Trace-Count", length(traces)}]
+    headers = headers ++ List.wrap(if container_id, do: {"Datadog-Container-ID", container_id})
+
     response =
       traces
       |> Enum.map(&format/1)
       |> encode()
-      |> push(state)
+      |> push(headers, state)
 
     if verbose? do
       Logger.debug(fn -> "Trace response: #{inspect(response)}" end)
@@ -200,12 +150,14 @@ defmodule SpandexDatadog.ApiServer do
   end
 
   @deprecated "Please use format/3 instead"
+  @doc false
   @spec format(Trace.t()) :: map()
   def format(%Trace{spans: spans, priority: priority, baggage: baggage}) do
     Enum.map(spans, fn span -> format(span, priority, baggage) end)
   end
 
   @deprecated "Please use format/3 instead"
+  @doc false
   @spec format(Span.t()) :: map()
   def format(%Span{} = span), do: format(span, 1, [])
 
@@ -223,14 +175,74 @@ defmodule SpandexDatadog.ApiServer do
       service: span.service,
       type: span.type,
       meta: meta(span),
-      metrics: %{
-        _sampling_priority_v1: priority,
-        "_dd1.sr.eausr": 1.0
-      }
+      metrics:
+        metrics(span, %{
+          _sampling_priority_v1: priority,
+          "_dd1.sr.eausr": 1.0
+          "_dd.rule_psr": 1.0,
+          "_dd.limit_psr": 1.0
+        })
     }
   end
 
   # Private Helpers
+
+  defp enqueue_trace(state, trace) do
+    if state.verbose? do
+      Logger.info(fn -> "Adding trace to stack with #{Enum.count(trace.spans)} spans" end)
+    end
+
+    %State{state | waiting_traces: [trace | state.waiting_traces]}
+  end
+
+  defp maybe_flush_traces(%{waiting_traces: traces, batch_size: size} = state) when length(traces) < size do
+    state
+  end
+
+  defp maybe_flush_traces(state) do
+    %{
+      asynchronous_send?: async?,
+      verbose?: verbose?,
+      waiting_traces: traces
+    } = state
+
+    if verbose? do
+      span_count = Enum.reduce(traces, 0, fn trace, acc -> acc + length(trace.spans) end)
+      Logger.info(fn -> "Sending #{length(traces)} traces, #{span_count} spans." end)
+      Logger.debug(fn -> "Trace: #{inspect(traces)}" end)
+    end
+
+    if async? do
+      if below_sync_threshold?(state) do
+        Task.start(fn ->
+          try do
+            send_and_log(traces, state)
+          after
+            Agent.update(state.agent_pid, fn count -> count - 1 end)
+          end
+        end)
+      else
+        # We get benefits from running in a separate process (like better GC)
+        # So we async/await here to mimic the behaviour above but still apply backpressure
+        task = Task.async(fn -> send_and_log(traces, state) end)
+        Task.await(task)
+      end
+    else
+      send_and_log(traces, state)
+    end
+
+    %State{state | waiting_traces: []}
+  end
+
+  defp below_sync_threshold?(state) do
+    Agent.get_and_update(state.agent_pid, fn count ->
+      if count < state.sync_threshold do
+        {true, count + 1}
+      else
+        {false, count}
+      end
+    end)
+  end
 
   @spec meta(Span.t()) :: map
   defp meta(span) do
@@ -262,8 +274,8 @@ defmodule SpandexDatadog.ApiServer do
   end
 
   @spec add_error_type(map, Exception.t() | nil) :: map
-  defp add_error_type(meta, nil), do: meta
-  defp add_error_type(meta, exception), do: Map.put(meta, "error.type", exception.__struct__)
+  defp add_error_type(meta, %struct{}), do: Map.put(meta, "error.type", struct)
+  defp add_error_type(meta, _), do: meta
 
   @spec add_error_message(map, Exception.t() | nil) :: map
   defp add_error_message(meta, nil), do: meta
@@ -306,12 +318,38 @@ defmodule SpandexDatadog.ApiServer do
   defp add_tags(meta, %{tags: nil}), do: meta
 
   defp add_tags(meta, %{tags: tags}) do
+    tags = tags |> Keyword.delete(:analytics_event)
+
     Map.merge(
       meta,
       tags
       |> Enum.map(fn {k, v} -> {k, term_to_string(v)} end)
       |> Enum.into(%{})
     )
+  end
+
+  @spec metrics(Span.t(), map) :: map
+  defp metrics(span, initial_value = %{}) do
+    initial_value
+    |> add_metrics(span)
+    |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+    |> Enum.into(%{})
+  end
+
+  @spec add_metrics(map, Span.t()) :: map
+  defp add_metrics(metrics, %{tags: nil}), do: metrics
+
+  defp add_metrics(metrics, %{tags: tags}) do
+    with analytics_event <- tags |> Keyword.get(:analytics_event),
+         true <- analytics_event != nil do
+      Map.merge(
+        metrics,
+        %{"_dd1.sr.eausr" => 1}
+      )
+    else
+      _ ->
+        metrics
+    end
   end
 
   @spec error(nil | Keyword.t()) :: integer
@@ -329,9 +367,9 @@ defmodule SpandexDatadog.ApiServer do
   defp encode(data),
     do: data |> deep_remove_nils() |> Msgpax.pack!(data)
 
-  @spec push(body :: iodata(), State.t()) :: any()
-  defp push(body, %State{http: http, host: host, port: port}),
-    do: http.put("#{host}:#{port}/v0.3/traces", body, @headers)
+  @spec push(body :: iodata(), headers, State.t()) :: any()
+  defp push(body, headers, %State{http: http, host: host, port: port}),
+    do: http.put("#{host}:#{port}/v0.3/traces", body, headers)
 
   @spec deep_remove_nils(term) :: term
   defp deep_remove_nils(term) when is_map(term) do
