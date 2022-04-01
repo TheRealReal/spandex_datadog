@@ -178,7 +178,7 @@ defmodule SpandexDatadog.ApiServer do
       metrics:
         metrics(span, %{
           _sampling_priority_v1: priority,
-          "_dd1.sr.eausr": 1.0
+          "_dd1.sr.eausr": 1.0,
           "_dd.rule_psr": 1.0,
           "_dd.limit_psr": 1.0
         })
