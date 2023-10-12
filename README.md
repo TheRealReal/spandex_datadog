@@ -1,5 +1,10 @@
 # SpandexDatadog
 
+This repository has been archived.
+
+📚 Archived Status:
+This repository is no longer actively maintained or updated. It is being preserved for historical reference or potential future use. Issues, pull requests, and contributions are no longer accepted.
+
 [![Package Version](https://img.shields.io/hexpm/v/spandex_datadog.svg)](https://hex.pm/packages/spandex_datadog)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/spandex_datadog/)
 [![Downloads](https://img.shields.io/hexpm/dt/spandex_datadog.svg)](https://hex.pm/packages/spandex_datadog)
